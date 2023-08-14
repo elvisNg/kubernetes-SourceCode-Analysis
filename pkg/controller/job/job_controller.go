@@ -172,7 +172,7 @@ func newControllerWithClock(ctx context.Context, podInformer coreinformers.PodIn
 		clock:                 clock,
 		podBackoffStore:       newBackoffStore(),
 	}
-
+	// register create update delete func
 	jobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			jm.enqueueSyncJobImmediately(logger, obj)
@@ -187,6 +187,7 @@ func newControllerWithClock(ctx context.Context, podInformer coreinformers.PodIn
 	jm.jobLister = jobInformer.Lister()
 	jm.jobStoreSynced = jobInformer.Informer().HasSynced
 
+	// register create update delete func
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			jm.addPod(logger, obj)
@@ -668,12 +669,14 @@ func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job) ([]*v1.Po
 	}
 	// List all pods to include those that don't match the selector anymore
 	// but have a ControllerRef pointing to this controller.
+	// 列出所有jm controller ref
 	pods, err := jm.podStore.Pods(j.Namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
 	// If any adoptions are attempted, we should first recheck for deletion
 	// with an uncached quorum read sometime after listing Pods (see #42639).
+	// 查询所有未被删除的可以adoptions的pod
 	canAdoptFunc := controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
 		fresh, err := jm.kubeClient.BatchV1().Jobs(j.Namespace).Get(ctx, j.Name, metav1.GetOptions{})
 		if err != nil {
@@ -716,7 +719,7 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 	defer func() {
 		logger.V(4).Info("Finished syncing job", "key", key, "elapsed", jm.clock.Since(startTime))
 	}()
-
+	// find key in the ns ,if not found delete key from expectations and return
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -811,6 +814,7 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 		job.Status.StartTime = &now
 	}
 
+	//mark job backoffRecord
 	jobCtx.newBackoffRecord = jm.podBackoffStore.newBackoffRecord(key, newSucceededPods, newFailedPods)
 
 	var manageJobErr error
@@ -844,6 +848,7 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 		jobCtx.succeeded = int32(jobCtx.succeededIndexes.total())
 		if hasBackoffLimitPerIndex(&job) {
 			jobCtx.failedIndexes = calculateFailedIndexes(logger, &job, pods)
+			//exceedsIndexesJobBackoffLimit set status failed
 			if jobCtx.finishedCondition == nil {
 				if job.Spec.MaxFailedIndexes != nil && jobCtx.failedIndexes.total() > int(*job.Spec.MaxFailedIndexes) {
 					jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, "MaxFailedIndexesExceeded", "Job has exceeded the specified maximal number of failed indexes", jm.clock.Now())
@@ -1476,6 +1481,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 		// Job does not specify a number of completions.  Therefore, number active
 		// should be equal to parallelism, unless the job has seen at least
 		// once success, in which leave whatever is running, running.
+		// 如果succeeded > 0 ，则job没有指定completions，则应该保持原有的状态运行
 		if jobCtx.succeeded > 0 {
 			wantActive = active
 		} else {
@@ -1492,7 +1498,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 			wantActive = 0
 		}
 	}
-
+	//保持运行数量
 	rmAtLeast := active + terminating - wantActive
 	if rmAtLeast < 0 {
 		rmAtLeast = 0
@@ -1562,6 +1568,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 		// prevented from spamming the API service with the pod create requests
 		// after one of its pods fails.  Conveniently, this also prevents the
 		// event spam that those failures would generate.
+		// size 1..2..4..8 每次不能超过diff的值
 		for batchSize := int32(integer.IntMin(int(diff), controller.SlowStartInitialBatchSize)); diff > 0; batchSize = integer.Int32Min(2*batchSize, diff) {
 			errorCount := len(errCh)
 			wait.Add(int(batchSize))
@@ -1609,6 +1616,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 			wait.Wait()
 			// any skipped pods that we never attempted to start shouldn't be expected.
 			skippedPods := diff - batchSize
+			//如果batch create 中失败pods ，则skippedPods 等待next controller resync
 			if errorCount < len(errCh) && skippedPods > 0 {
 				logger.V(2).Info("Slow-start failure. Skipping creating pods, decrementing expectations", "skippedCount", skippedPods, "job", klog.KObj(job))
 				active -= skippedPods
