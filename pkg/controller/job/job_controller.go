@@ -676,7 +676,7 @@ func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job) ([]*v1.Po
 	}
 	// If any adoptions are attempted, we should first recheck for deletion
 	// with an uncached quorum read sometime after listing Pods (see #42639).
-	// 查询所有未被删除的可以adoptions的pod
+	// 查询未被删除的可以adoptions的pod
 	canAdoptFunc := controller.RecheckDeletionTimestamp(func(ctx context.Context) (metav1.Object, error) {
 		fresh, err := jm.kubeClient.BatchV1().Jobs(j.Namespace).Get(ctx, j.Name, metav1.GetOptions{})
 		if err != nil {
@@ -719,7 +719,6 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 	defer func() {
 		logger.V(4).Info("Finished syncing job", "key", key, "elapsed", jm.clock.Since(startTime))
 	}()
-	// find key in the ns ,if not found delete key from expectations and return
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -843,6 +842,7 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 		}
 	}
 
+	//indexJob处理
 	if isIndexedJob(&job) {
 		jobCtx.prevSucceededIndexes, jobCtx.succeededIndexes = calculateSucceededIndexes(logger, &job, pods)
 		jobCtx.succeeded = int32(jobCtx.succeededIndexes.total())
@@ -862,6 +862,7 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 	suspendCondChanged := false
 	// Remove active pods if Job failed.
 	if jobCtx.finishedCondition != nil {
+		//try to release jm active pods
 		deleted, err := jm.deleteActivePods(ctx, &job, jobCtx.activePods)
 		if deleted != active || !satisfiedExpectations {
 			// Can't declare the Job as finished yet, as there might be remaining
@@ -872,6 +873,7 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 		manageJobErr = err
 	} else {
 		manageJobCalled := false
+		//因为satisfiedExpectations，或者需要deletion，所以递归重新编排jm pods
 		if satisfiedExpectations && job.DeletionTimestamp == nil {
 			active, action, manageJobErr = jm.manageJob(ctx, &job, jobCtx)
 			manageJobCalled = true
@@ -1481,7 +1483,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 		// Job does not specify a number of completions.  Therefore, number active
 		// should be equal to parallelism, unless the job has seen at least
 		// once success, in which leave whatever is running, running.
-		// 如果succeeded > 0 ，则job没有指定completions，则应该保持原有的状态运行
+		//为了防止job被中途干预导致失败，wantActive = active
 		if jobCtx.succeeded > 0 {
 			wantActive = active
 		} else {
@@ -1498,7 +1500,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 			wantActive = 0
 		}
 	}
-	//保持运行数量
+	//最少移除数量
 	rmAtLeast := active + terminating - wantActive
 	if rmAtLeast < 0 {
 		rmAtLeast = 0
@@ -1549,15 +1551,16 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 		jm.expectations.ExpectCreations(logger, jobKey, int(diff))
 		errCh := make(chan error, diff)
 		logger.V(4).Info("Too few pods running", "key", jobKey, "need", wantActive, "creating", diff)
-
+		//协程锁
 		wait := sync.WaitGroup{}
-
+		//赋值新的active
 		active += diff
 
 		podTemplate := job.Spec.Template.DeepCopy()
 		if isIndexedJob(job) {
 			addCompletionIndexEnvVariables(podTemplate)
 		}
+		//初始化finalizers
 		podTemplate.Finalizers = appendJobCompletionFinalizerIfNotFound(podTemplate.Finalizers)
 
 		// Batch the pod creates. Batch sizes start at SlowStartInitialBatchSize
@@ -1581,6 +1584,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 				go func() {
 					template := podTemplate
 					generateName := ""
+					//处理indexJobPods
 					if completionIndex != unknownCompletionIndex {
 						template = podTemplate.DeepCopy()
 						addCompletionIndexAnnotation(template, completionIndex)
